@@ -86,6 +86,7 @@ class OfflineTrainer(Trainer):
 			# Update agent
 			train_metrics = self.agent.update(self.buffer)
 			
+			# Checks for pruning
 			if self.think_every:
 				if i % self.think_every == 0:
 					self.agent.think()

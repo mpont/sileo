@@ -47,6 +47,7 @@ class OnlineTrainer(Trainer):
 				
 				if isinstance(action[0], defs.Action): #action is a list of actions then
 					if self.cfg.split_frac<1:
+						#Recover embeddings within the command space to act on the environment
 						act = torch.cat((torch.stack([a.embedding for a in action[:split]]), torch.stack(action[split:]).cpu()))
 					else:
 						act = torch.stack([a.embedding for a in action[:split]])
@@ -127,6 +128,7 @@ class OnlineTrainer(Trainer):
 				action = self.agent.act(obs, t0=len(self._tds)==1)
 
 				if isinstance(action[0], defs.Action): #action is a list of actions then
+					#Recover embeddings in the command space to act on the environment
 					if self.cfg.split_frac<1:
 						act = torch.cat((torch.stack([a.embedding for a in action[:split]]), torch.stack(action[split:]).cpu()))
 					else:
@@ -135,6 +137,8 @@ class OnlineTrainer(Trainer):
 					z = obs
 					obs, reward, done, info = self.env.step(act)
 					y = obs.to(self.agent.device, non_blocking=True)
+
+					#Update each of the actions' buffer with the observed transitions
 					for i in range(split):
 						action[i].update_buffer(torch.stack((hang(z[i]), hang(y[i]))))
 						for u in self.agent.completed_actions[i]:
@@ -163,23 +167,19 @@ class OnlineTrainer(Trainer):
 					_train_metrics = self.agent.update(self.buffer)
 				self.agent.thought = agent_thought
 				train_metrics.update(_train_metrics)
-    
+
+				#Check if pruning is required
 				if self.think_every and self._step>self.pretrain_frac*self.cfg.steps and self.agent.thought:
 					if self._step % self.think_every == 0:
 						self.agent.think()
 						if self.match and self.agent.fp is not None:
 							self.agent.match_actions()
 
+				#Check if first pruning and/or action transfer are needed at the end of pretraining
 				elif self._step == int(self.pretrain_frac*self.cfg.steps):
 					self.agent.think()
 					if self.match:
 						self.agent.match_actions()
-				
-				
-				# if  self.match and self.agent.thought:
-				# 	self.agent.match_actions(self.cfg.pretrained_model_path)
-				# 	self.match = False
-
 				
 			self._step += self.cfg.num_envs
 

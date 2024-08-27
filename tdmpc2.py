@@ -18,8 +18,8 @@ from ville.state.suspension import Suspension
 class SILEO_TDMPC2:
 	"""
 	Adapted TD-MPC2 agent. Implements training + inference.
-	Can be used for both single-task and multi-task experiments,
-	and supports both state and pixel observations.
+	Can be used for single-task experiments,
+	and supports state observations.
 	"""
 
 	def __init__(self, cfg, actions=None, model = None, fp=None):
@@ -41,23 +41,24 @@ class SILEO_TDMPC2:
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda'
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		
-		self.buffer_max_length = cfg.buffer_max_length
+		self.buffer_max_length = cfg.buffer_max_length #Buffer to use while pruning
 		print(self.buffer_max_length)
 		self.n_entries = 0
-		self.thought = False
+		self.thought = False #Indicates if pre-training has ended
+		self.reshuffle= False #Used if instead of refining an action set a new action set should be used after each pruning
 		self.buffer = []
-		self.action_list = []
-		self.action_embeddings = []
-		self.stacked_actions = [deque() for _ in range(self.cfg.num_envs)]
-		self.completed_actions = []
-		self.pruning = cfg.pruning
-		self.first_prune = cfg.first_prune
-		self.pruning_factor = cfg.pruning_factor
-		self.k_means_attempts = cfg.k_means_attempts
-		self.s = Suspension(self.device)
-		self.split = int(np.floor(self.cfg.num_envs * self.cfg.split_frac))
-		self.reshuffle = False
-		self.old_actions = actions
+		self.action_list = [] #Stores all available Actions during training
+		self.action_embeddings = [] #KDTree used in practice to retrieve nearest action given an embedding
+		self.stacked_actions = [deque() for _ in range(self.cfg.num_envs)] #Used to unstack a sequence of primitives once a composite action was chosen
+		self.completed_actions = [] #Lists all actions to update once a primitive has been executed
+		self.first_prune = cfg.first_prune #Checks if composite actions should be introduced alongside the first primitives
+		self.pruning_factor = cfg.pruning_factor # Number of medians to use as threshold
+		self.k_means_attempts = cfg.k_means_attempts #Used in clustering
+		self.s = Suspension(self.device) #Instantiates the type of projections to use
+		self.split = int(np.floor(self.cfg.num_envs * self.cfg.split_frac)) #Split between discrete and continuous environments
+		
+		#Used to transfer knowledge from an old task
+		self.old_actions = actions 
 		self.old_model = model
 		self.fp = fp
 
@@ -105,30 +106,20 @@ class SILEO_TDMPC2:
 		
 		if load_model:
 			self.model.load_state_dict(state_dict["model"])
-		if state_dict["actions"] and load_actions:
-			self.action_list = state_dict["actions"]
 
 	def match_actions(self, task=None):
-		# state_dict = self.fp if isinstance(self.fp, dict) else torch.load(self.fp)
-		# second_model = self.old_model
+		'''
+		Used to match actions used in a previous task with actions currently used.
+		Computes distance between these tasks using mean geodesic distance between matched actions.
+		'''
+		
 		second_action_list = self.old_actions
-		# hang = self.s.hang
-		# buffer = [u.cpu() for u in self.buffer]
-		# sample = np.random.choice(buffer, int((self.cfg.latent_dim**1.2)/self.cfg.matching_factor))
-		# sample = [u[np.random.randint(self.cfg.num_envs)] for u in buffer]
-		# # transitions = np.array([(hang(second_model.encode(u.to(self.device), task).nan_to_num(0)), hang(self.model.encode(u.to(self.device), task).nan_to_num(0))) for u in sample])
-		# context_shift = defs.Action(self.cfg, transitions, self.action_list[0].embedding)
-		# for action in second_action_list:
-			# action.embedding = torch.matmul(context_shift.rotation, action.embedding)
-			# action.rotation = torch.matmul(context_shift.rotation, action.rotation)
-			# action.buffer = torch.tensor(np.array([
-			# 	[torch.matmul(context_shift.rotation,u[0]), torch.matmul(context_shift.rotation, u[1])] for u in action.buffer]))
 		
 		distances = np.array([[a.distance(b) for b in second_action_list] for a in self.action_list])
 		new_actions_preferences = np.array([np.argsort(distances[u]) for u in range(len(self.action_list))])
 		old_actions_preferences = np.array([np.argsort(distances.T[u]) for u in range(len(second_action_list))])
 		matches = [-1 for u in self.action_list]
-		print("B")
+		
 		# Gale-Shapley
 		try:
 			while matches.index(-1) > -1:
@@ -158,16 +149,17 @@ class SILEO_TDMPC2:
 		
 	@torch.no_grad()
 	def store_observation(self, observation):
-
+		'''
+		Stores observation passed to the agent in the buffer and ensures
+		the buffer does not exceed a certain length
+		'''
 		if isinstance(self.buffer, torch.Tensor):
-			print("B")
 			self.buffer = self.buffer.roll(-1)
 			self.buffer[-1] = observation
 		else:
 			if len(self.buffer) < self.buffer_max_length:
 				self.buffer.append(observation)
 			else:
-				print("A")
 				self.buffer[:] = self.buffer[-self.buffer_max_length//2:]
 				self.buffer.append(observation)
 
@@ -175,7 +167,7 @@ class SILEO_TDMPC2:
 
 	@torch.no_grad()
 	def cluster(self, actions):
-	# Find optimal centroids for the actions seen through the buffer
+	# Find optimal number centroids for the actions seen through the buffer
 		score = 0
 		argmax = 0
 		for i in range(8, self.cfg.max_primitives, 2):
@@ -184,14 +176,20 @@ class SILEO_TDMPC2:
 			if sc>score:
 				score = sc
 				argmax = i
-		return KMedoids(n_clusters = 512).fit(actions)
+		return KMedoids(n_clusters = 2*argmax).fit(actions)
 
 	@torch.no_grad()
 	def think(self, eval_mode = False, task = None):
+		'''
+		Essentially the pruning algorithm described in the paper;
+		Clusters actions in the buffer to find relevant new primitives
+		Refines these primitives into larger sequences with composite actions
+		'''
 		hang = self.s.hang
 		
 		if not self.thought:
 			print("Starting to reflect...")
+			#Clustering of primitives
 			if task is not None:
 				task = torch.tensor([task], device=self.device)
 			if len(self.buffer) > 2* self.cfg.buffer_max_length:
@@ -211,7 +209,7 @@ class SILEO_TDMPC2:
 			if len(buffer.size()) > 2:
 				buffer = buffer.mean(axis= self.buffer.size().index(self.cfg.num_envs))
 			
-			ends = 1 #Goes from 1 to num_envs, since torch.cat concatenates the 
+			#Builds actions from the cluster centers using the assigned actions' transitions as theirs
 			for centroid in range(k):	
 				assignments = [torch.stack((buffer[i], buffer[i+1])) for i, label in enumerate(labels)
 				if (label==centroid and i%len(self.buffer)+1 != 0 and i<len(buffer) -1)]
@@ -226,6 +224,7 @@ class SILEO_TDMPC2:
 				except:
 					pass
 
+			#Build composite actions
 			if self.first_prune:
 				occ = [a.occurrences for a in self.action_list]
 				median = torch.median(torch.tensor(occ))
@@ -233,6 +232,7 @@ class SILEO_TDMPC2:
 				std = torch.std(torch.tensor(occ, dtype = torch.float32))
 
 				while max(occ)>self.pruning_factor*median:
+					#Find overused primitive and evaluate likelihood of possible continuations
 					ind = occ.index(max(occ))
 					action = self.action_list[ind]
 					distribution = [0 for u in centroids]
@@ -246,6 +246,7 @@ class SILEO_TDMPC2:
 					distribution = [len(u) for u in transitions]
 	
 					reassigned = 0
+					# Build composite actions from most likely continuations
 					for j in range(k):
 						try:
 							if distribution[j]>min(median*self.pruning_factor, mean+2*std):
@@ -255,7 +256,7 @@ class SILEO_TDMPC2:
 								reassigned += len(transitions[j])
 						except:
 							pass
-					occ[ind]=0
+
 					if reassigned == 0: # Abandon
 						occ[ind] = 0					
 
@@ -275,6 +276,10 @@ class SILEO_TDMPC2:
 
 	@torch.no_grad()
 	def find_action(self, state, embedding, task = None): # Note: state here is a SINGLE state, not a batch
+	'''
+	Finds an action given a proposed embedding a state by evaluating discounted rewards 
+	after execution of all actions that "start" with the nearest primitive action
+	'''
 		distances, _ = self.action_embeddings.query(np.array(embedding.unsqueeze(0).cpu().nan_to_num(0)))
 		d = min(distances)
 		candidates = [i for i, dist in enumerate(distances) if dist == d]
@@ -287,20 +292,25 @@ class SILEO_TDMPC2:
 		else:
 			return candidates[0]
 		
-		return candidates[valuations.index(max(valuations))] # Returns index in self.action_list
+		return candidates[valuations.index(max(valuations))] # Returns index in self.action_list of the action to use
 
 	@torch.no_grad()
 	def prune(self, eval_mode = False, task = None):
+		'''
+		Use for repeated pruning in downstream learning, essentially identical to think
+		'''
 		assert(self.thought)
+		#Overhead
 		unhang = self.s.unhang
 		hang = self.s.hang
 		self.thought = False
 		if len(self.buffer) > 2* self.cfg.buffer_max_length or len(self.buffer) > 20000:
-			print("SHORT?")
 			self.buffer = self.buffer[-self.buffer_max_length:]
 		actions = tuple([self.act(obs, task, think= True, override = True) for obs in self.buffer])
 		base = np.array(torch.cat(actions))
 		self.thought = True
+
+		#Cluster and find relevant new primitives
 		kmeans = self.cluster(base)
 		labels, centroids = kmeans.labels_, kmeans.cluster_centers_
 		k = len(centroids)
@@ -330,11 +340,11 @@ class SILEO_TDMPC2:
 			self.action_list.append(defs.Action(self.cfg, transitions[centroid], centroids[centroid]))
 
 
+		#Build new composite actions
 		occ = [a.occurrences for a in self.action_list]
 		median = torch.median(torch.tensor(occ))
 		mean = torch.mean(torch.tensor(occ, dtype = torch.float32))
 		std = torch.std(torch.tensor(occ, dtype = torch.float32))
-
 		while max(occ) > min(self.pruning_factor*median, median + 2*std):
 			ind = occ.index(max(occ))
 			root_action = self.action_list[ind]
@@ -342,6 +352,7 @@ class SILEO_TDMPC2:
 			buffer = root_action.buffer
 			transitions = [torch.tensor([]).to(self.device) for i in range(len(self.action_list))]
 
+			# Evaluate the best continuation for the most used action
 			self.thought = False
 			for u in buffer:
 				v = unhang(u[1]).to(self.device, non_blocking=True)
@@ -358,8 +369,9 @@ class SILEO_TDMPC2:
 					transitions[action2] = torch.stack((transitions[action2], torch.stack((hang(u), torch.matmul(self.action_list[action2].rotation, hang(v))))))
 				else:
 					transitions[action2] = torch.cat((transitions[action2], torch.stack((hang(u), torch.matmul(self.action_list[action2].rotation, hang(v)))).unsqueeze(0)))
-					
 			self.thought = True
+			
+			#Construct the new composite actions
 			for j in range(len(distribution)):
 				if distribution[j]>median/self.pruning_factor:
 					try:
@@ -396,7 +408,7 @@ class SILEO_TDMPC2:
 
 
 		obs = obs.to(self.device, non_blocking=True)
-		if not think:
+		if not think: #If not planning/reflecting on imagined states
 			self.store_observation(obs)
 
 		if task is not None:
@@ -404,12 +416,14 @@ class SILEO_TDMPC2:
 		z = self.model.encode(obs, task)
 		
 		out = [[] for _ in range(envs)]
+		#Check if composite actions are being executed at current timestep and yield the next primitive
 		for i in range(envs):
 			if self.stacked_actions[i]:				
 				out[i] = self.stacked_actions[i].popleft()
 				while 0 < len(self.stacked_actions[i]) and isinstance(self.stacked_actions[i][0], defs.Composite_Action):
 					self.completed_actions[i].append(self.stacked_actions[i].popleft())
 
+		#Plan for the next action
 		if self.cfg.mpc and not override:
 			if not self.thought:
 				a = self.plan(z, t0=t0, eval_mode=eval_mode, task=task)
@@ -418,12 +432,14 @@ class SILEO_TDMPC2:
 		else:
 			a = self.model.pi(z, task)[int(not eval_mode)]
 		
+		#Recast policy actions to the nearest primitives or useful composite actions and start their execution
 		if self.thought:
 			for i in range(split):
 				if not out[i]:
 					action = self.action_list[self.find_action(z[i], a[i], task)]
 					self.stacked_actions[i].extend(action.flatten())
 					out[i] = self.stacked_actions[i].popleft()
+			#Used for continuous environments that continue working alongside our framework 
 			if split<envs:
 				out[split:] = list(a[split:])
 			return out
@@ -431,48 +447,27 @@ class SILEO_TDMPC2:
 		else:
 			return a.cpu()
 
-	# @torch.no_grad()
-	# def truncate_composite_trajectory(self, z, action):
-	# 	assert isinstance(action, defs.Composite_Action)
-
-	# 	discrepancy = action.yield_discrepancy() 
-	# 	difference = torch.linalg.norm(torch.matmul(action.assemble(), z) - torch.matmul(action.rotation, z))
-	# 	n = len(action.actions)
-	# 	q = n- min((difference/discrepancy)*n, n)
-
-	# 	u = copy.deepcopy(action)
-	# 	u.actions = action.actions[:q]
-	# 	A = u.assemble()
-		
-	# 	return torch.matmul(A, z), u, q
-
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
 		t = 0
 		while t < self.cfg.horizon:
-		
-			# Truncate???
-			# if isinstance(actions, defs.Composite_Action):
-			# 	z, u, q = self.truncate_composite_trajectory(z, actions)
-			# 	actions = u
-			# 	d = self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
-			# 	discount *= d** (q/2)
+			# Evaluate rewards taking into account uncertainty for composite actions
 			if isinstance(actions, defs.Composite_Action):
 				for a in actions.actions:
 					reward = math.two_hot_inv(self.model.reward(z, a.embedding.to(self.device), task), self.cfg)
 					z = self.model.next(z, a, task)
 					G += discount * reward
 					discount *= self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
-				t+= self.cfg.horizon
+				t+= self.cfg.horizon # Actions already had their planning value estimation, no need to repeat in-depth estimation
 			elif isinstance(actions, defs.Action):
 				a = actions
 				reward = math.two_hot_inv(self.model.reward(z, a.embedding.to(self.device), task), self.cfg)
 				z= self.model.next(z, actions, task)
 				G += discount * reward
 				discount *= self.discount[torch.tensor(task)] if self.cfg.multitask else self.discount
-				t+= self.cfg.horizon
+				t+= self.cfg.horizon # Actions already had their separate value estimation, no need to repeat in-depth estimation
 			else:
 				reward = math.two_hot_inv(self.model.reward(z, actions[:, t].to(self.device), task), self.cfg)
 				z = self.model.next(z, actions[:, t], task)
@@ -506,6 +501,8 @@ class SILEO_TDMPC2:
 		if self.cfg.num_pi_trajs > 0:
 			pi_actions = torch.empty(self.cfg.num_envs, self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 			_z = z.unsqueeze(1).repeat(1, self.cfg.num_pi_trajs, 1) # Shape (num_envs, num_pi_trajs, latent_dim)
+			
+			#Recast proposed policy actions as Actions and plan using them
 			if self.thought:
 				_obs = obs.unsqueeze(1).repeat(1, self.cfg.num_pi_trajs, 1)
 			for t in range(self.cfg.horizon):
@@ -525,7 +522,8 @@ class SILEO_TDMPC2:
 					acts = pi_actions[:, t]					
 					if t < self.cfg.horizon -1:
 						_z = self.model.next(_z, acts, task)
-					
+				
+				# Return embeddings of the Actions chosen to be used for MPPI
 				if self.thought:
 					for i in range(split):
 						for j in range(self.cfg.num_pi_trajs):
@@ -628,7 +626,9 @@ class SILEO_TDMPC2:
 
 	@torch.no_grad()
 	def rollout(self, obs, action, task):
-
+		'''
+		Auxiliary function used to rollout intermediary states when executing a composite action
+		'''
 		states = []
 		for act in action.actions:
 			obs = self.model.next(obs, act, task)
@@ -672,6 +672,7 @@ class SILEO_TDMPC2:
 				with torch.no_grad():
 					if t == 0:
 						ts = np.zeros(self.cfg.batch_size, dtype = np.int16)
+					# Sample actions for every element of the batch, plan and act using them before updating for rollout
 					for b in range(self.cfg.batch_size):
 						if ts[b] < self.cfg.horizon:
 							act = self.action_list[self.find_action(z[b], action[ts[b], b], task)]
@@ -692,13 +693,16 @@ class SILEO_TDMPC2:
 								z[b] = self.model.encode(_ob[b], task)
 								ts[b]+= 1
 							if ts[b]< self.cfg.horizon:
-								act.update_buffer(torch.stack([hang(_obs[ts[b]-1][b]), hang(_obs[ts[b]][b])]))
+								act.update_buffer(torch.stack([hang(obs[ts[b]-1][b]), hang(obs[ts[b]][b])]))
 					t = min(ts)
 			else:
+				#Baseline for pre-training
 				z = self.model.next(z, action[t], task)
 				zs[t+1] = z
 				t+= 1
+
 		if self.thought:
+			#Back-and-forth through numpy to reroot the autograd computation graph and encode imagined observations
 			zs = self.model.encode(torch.tensor(np.array(_obs.cpu())).to(self.device), task)
 		
 	
