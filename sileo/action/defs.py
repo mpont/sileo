@@ -69,8 +69,8 @@ class Action():
         return [self]
     
     def distance(self, action): #Geodesic distance calculation between self and another instance of Action
-        values = torch.angle(torch.tensor(tuple(torch.linalg.eig(torch.transpose(self.rotation, 0, 1) @ action.rotation).cpu())))
-        return torch.sqrt(torch.sum(torch.tensor(numpy.array([a*a for a in values]))))
+        values = torch.angle(tuple(torch.linalg.eig(torch.transpose(self.rotation, 0, 1) @ action.rotation))[0])
+        return torch.sqrt(torch.sum(values*values))
         
 
 class Composite_Action(Action):
